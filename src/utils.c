@@ -6,6 +6,7 @@
 #include <access/htup_details.h>
 #include <nodes/nodes.h>
 #include <nodes/makefuncs.h>
+#include <parser/scansup.h>
 #include <utils/guc.h>
 #include <utils/date.h>
 #include <utils/datetime.h>
@@ -148,37 +149,37 @@ Datum
 time_to_internal(PG_FUNCTION_ARGS)
 {
 	Datum		val;
-	Oid			type;
+	Oid			type_oid;
 	int64		res;
 
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
 
 	val = PG_GETARG_DATUM(0);
-	type = PG_GETARG_OID(1);
+	type_oid = PG_GETARG_OID(1);
 
-	res = time_value_to_internal(val, type);
+	res = time_value_to_internal(val, type_oid, false);
 	PG_RETURN_INT64(res);
 }
 
 
 /*	*/
 int64
-time_value_to_internal(Datum time_val, Oid type)
+time_value_to_internal(Datum time_val, Oid type_oid, bool failure_ok)
 {
-	if (type == INT8OID)
+	if (type_oid == INT8OID)
 	{
 		return DatumGetInt64(time_val);
 	}
-	if (type == INT4OID)
+	if (type_oid == INT4OID)
 	{
 		return (int64) DatumGetInt32(time_val);
 	}
-	if (type == INT2OID)
+	if (type_oid == INT2OID)
 	{
 		return (int64) DatumGetInt16(time_val);
 	}
-	if (type == TIMESTAMPOID)
+	if (type_oid == TIMESTAMPOID)
 	{
 		/*
 		 * for timestamps, ignore timezones, make believe the timestamp is at
@@ -188,13 +189,13 @@ time_value_to_internal(Datum time_val, Oid type)
 
 		return DatumGetInt64(res);
 	}
-	if (type == TIMESTAMPTZOID)
+	if (type_oid == TIMESTAMPTZOID)
 	{
 		Datum		res = DirectFunctionCall1(pg_timestamp_to_unix_microseconds, time_val);
 
 		return DatumGetInt64(res);
 	}
-	if (type == DATEOID)
+	if (type_oid == DATEOID)
 	{
 		Datum		tz = DirectFunctionCall1(date_timestamp, time_val);
 		Datum		res = DirectFunctionCall1(pg_timestamp_to_unix_microseconds, tz);
@@ -202,7 +203,8 @@ time_value_to_internal(Datum time_val, Oid type)
 		return DatumGetInt64(res);
 	}
 
-	elog(ERROR, "unkown time type oid '%d'", type);
+	if (!failure_ok)
+		elog(ERROR, "unkown time type oid '%d'", type_oid);
 	return -1;
 }
 
@@ -248,8 +250,12 @@ create_fmgr(char *schema, char *function_name, int num_args)
 	return finfo;
 }
 
+/* Returns the period in the same representation as Postgres Timestamps.
+ * (i.e. in microseconds if  HAVE_INT64_TIMESTAMP, seconds otherwise).
+ * Note that this is not our internal representation (microseconds).
+ * Always returns an exact value.*/
 static inline int64
-get_interval_period(Interval *interval)
+get_interval_period_timestamp_units(Interval *interval)
 {
 	if (interval->month != 0)
 	{
@@ -284,7 +290,7 @@ timestamp_bucket(PG_FUNCTION_ARGS)
 	if (TIMESTAMP_NOT_FINITE(timestamp))
 		PG_RETURN_TIMESTAMP(timestamp);
 
-	period = get_interval_period(interval);
+	period = get_interval_period_timestamp_units(interval);
 	/* result = (timestamp / period) * period */
 	TMODULO(timestamp, result, period);
 	if (timestamp < 0)
@@ -316,7 +322,7 @@ timestamptz_bucket(PG_FUNCTION_ARGS)
 	if (TIMESTAMP_NOT_FINITE(timestamp))
 		PG_RETURN_TIMESTAMPTZ(timestamp);
 
-	period = get_interval_period(interval);
+	period = get_interval_period_timestamp_units(interval);
 	/* result = (timestamp / period) * period */
 	TMODULO(timestamp, result, period);
 	if (timestamp < 0)
@@ -375,7 +381,7 @@ date_bucket(PG_FUNCTION_ARGS)
 	if (DATE_NOT_FINITE(date))
 		PG_RETURN_DATEADT(date);
 
-	period = get_interval_period(interval);
+	period = get_interval_period_timestamp_units(interval);
 	/* check the period aligns on a date */
 	check_period_is_daily(period);
 
@@ -383,4 +389,63 @@ date_bucket(PG_FUNCTION_ARGS)
 	converted_ts = DirectFunctionCall1(date_timestamp, PG_GETARG_DATUM(1));
 	bucketed = DirectFunctionCall2(timestamp_bucket, PG_GETARG_DATUM(0), converted_ts);
 	return DirectFunctionCall1(timestamp_date, bucketed);
+}
+
+/* Returns approximate period in microseconds */
+int64
+get_interval_period_approx(Interval *interval)
+{
+	return interval->time + (((interval->month * 30) + interval->day) * USECS_PER_DAY);
+}
+
+/* Returns approximate period in microseconds */
+int64
+date_trunc_interval_period_approx(text *units)
+{
+	int			decode_type,
+				val;
+	char	   *lowunits = downcase_truncate_identifier(VARDATA_ANY(units),
+														VARSIZE_ANY_EXHDR(units),
+														false);
+
+	decode_type = DecodeUnits(0, lowunits, &val);
+
+	if (decode_type != UNITS)
+		return -1;
+
+	switch (val)
+	{
+		case DTK_WEEK:
+			return 7 * USECS_PER_DAY;
+		case DTK_MILLENNIUM:
+			return 1000 * 356 * USECS_PER_DAY;
+		case DTK_CENTURY:
+			return 100 * 356 * USECS_PER_DAY;
+		case DTK_DECADE:
+			return 10 * 356 * USECS_PER_DAY;
+		case DTK_YEAR:
+			return 1 * 356 * USECS_PER_DAY;
+		case DTK_QUARTER:
+			return 89 * USECS_PER_DAY;
+		case DTK_MONTH:
+			return 30 * USECS_PER_DAY;
+		case DTK_DAY:
+			return USECS_PER_DAY;
+		case DTK_HOUR:
+			return USECS_PER_HOUR;
+		case DTK_MINUTE:
+			return USECS_PER_MINUTE;
+		case DTK_SECOND:
+			return USECS_PER_SEC;
+		case DTK_MILLISEC:
+			return USECS_PER_SEC / 1000;
+		case DTK_MICROSEC:
+			return 1;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("timestamp units \"%s\" not supported",
+							lowunits)));
+	}
+	return -1;
 }
